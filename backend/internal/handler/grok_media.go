@@ -90,14 +90,11 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 	if endpoint.RequiresRequestBody() {
 		body, err = pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
 		if err != nil {
-			if handleRequestBodyReadError(c, err) {
+			if handleRequestBodyReadError(c, reqLog, err) {
 				return
 			}
-			if maxErr, ok := extractMaxBytesError(err); ok {
-				h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
-				return
-			}
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+			status, message := requestBodyReadFailure(reqLog, c.Request, err)
+			h.errorResponse(c, status, "invalid_request_error", message)
 			return
 		}
 		if len(body) == 0 {
@@ -403,6 +400,11 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, responseLatencyMs)
 
 		if err != nil {
+			var validationErr *service.GrokMediaInputValidationError
+			if errors.As(err, &validationErr) {
+				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", validationErr.Error())
+				return
+			}
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				if failoverClientGone(c) {

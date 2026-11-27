@@ -50,14 +50,11 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 
 	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
-		if handleRequestBodyReadError(c, err) {
+		if handleRequestBodyReadError(c, reqLog, err) {
 			return
 		}
-		if maxErr, ok := extractMaxBytesError(err); ok {
-			h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
-			return
-		}
-		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		status, message := requestBodyReadFailure(reqLog, c.Request, err)
+		h.errorResponse(c, status, "invalid_request_error", message)
 		return
 	}
 	if len(body) == 0 {
@@ -295,6 +292,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, requestModel, false, result), false, nil, err)
 					} else {
 						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, requestModel, false, result), true, nil)
+						h.recordOpenAIImagesSafetyRefusal(c, apiKey, account, clientRequestModel, parsed.Prompt, imageUpstreamErr)
 					}
 					logEvent := "openai.images.upstream_user_error"
 					if retryableServerError {

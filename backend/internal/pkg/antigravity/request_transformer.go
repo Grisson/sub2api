@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/gemini"
 	"github.com/google/uuid"
 )
 
@@ -111,7 +112,7 @@ func TransformClaudeToGeminiWithOptions(claudeReq *ClaudeRequest, projectID, map
 	allowDummyThought := strings.HasPrefix(targetModel, "gemini-")
 
 	// 1. 构建 contents
-	contents, messageSystemParts, strippedThinking, err := buildContents(claudeReq.Messages, toolIDToName, isThinkingEnabled, allowDummyThought)
+	contents, messageSystemParts, strippedThinking, err := buildContents(claudeReq.Messages, toolIDToName, isThinkingEnabled, allowDummyThought, gemini.SupportsMultimodalFunctionResponses(targetModel))
 	if err != nil {
 		return nil, fmt.Errorf("build contents: %w", err)
 	}
@@ -300,6 +301,7 @@ var systemIdentityOpeners = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are a Claude agent, built on Anthropic'?s Claude Agent SDK\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Claude Code, Anthropic'?s official CLI for Claude\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Codex,? (?:a coding agent |an agent )?based on GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)*\.?`),
+	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Codex, a coding agent\.`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)* running in the Codex CLI\.?`),
 }
 
@@ -419,7 +421,7 @@ func buildSystemInstruction(system json.RawMessage, modelName string, opts Trans
 }
 
 // buildContents 构建 contents
-func buildContents(messages []ClaudeMessage, toolIDToName map[string]string, isThinkingEnabled, allowDummyThought bool) ([]GeminiContent, []GeminiPart, bool, error) {
+func buildContents(messages []ClaudeMessage, toolIDToName map[string]string, isThinkingEnabled, allowDummyThought, multimodalToolResults bool) ([]GeminiContent, []GeminiPart, bool, error) {
 	var contents []GeminiContent
 	var systemParts []GeminiPart
 	strippedThinking := false
@@ -430,7 +432,7 @@ func buildContents(messages []ClaudeMessage, toolIDToName map[string]string, isT
 			role = "model"
 		}
 
-		parts, strippedThisMsg, err := buildParts(msg.Content, toolIDToName, allowDummyThought)
+		parts, strippedThisMsg, err := buildParts(msg.Content, toolIDToName, allowDummyThought, multimodalToolResults)
 		if err != nil {
 			return nil, nil, false, fmt.Errorf("build parts for message %d: %w", i, err)
 		}
@@ -484,7 +486,7 @@ const DummyThoughtSignature = "skip_thought_signature_validator"
 
 // buildParts 构建消息的 parts
 // allowDummyThought: 只有 Gemini 模型支持 dummy thought signature
-func buildParts(content json.RawMessage, toolIDToName map[string]string, allowDummyThought bool) ([]GeminiPart, bool, error) {
+func buildParts(content json.RawMessage, toolIDToName map[string]string, allowDummyThought, multimodalToolResults bool) ([]GeminiPart, bool, error) {
 	var parts []GeminiPart
 	strippedThinking := false
 
@@ -503,6 +505,8 @@ func buildParts(content json.RawMessage, toolIDToName map[string]string, allowDu
 		return nil, false, fmt.Errorf("parse content blocks: %w", err)
 	}
 
+	var toolMediaParts []GeminiPart
+	var toolResults []GeminiPart
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
@@ -580,20 +584,27 @@ func buildParts(content json.RawMessage, toolIDToName map[string]string, allowDu
 			// 解析 content
 			resultContent := parseToolResultContent(block.Content, block.IsError)
 
-			parts = append(parts, GeminiPart{
-				FunctionResponse: &GeminiFunctionResponse{
-					Name: funcName,
-					Response: map[string]any{
-						"result": resultContent,
-					},
-					ID: block.ToolUseID,
-				},
-			})
-			parts = append(parts, extractToolResultInlineParts(block.Content)...)
+			response := &GeminiFunctionResponse{
+				Name:     funcName,
+				Response: map[string]any{"result": resultContent},
+				ID:       block.ToolUseID,
+			}
+			media := extractToolResultInlineParts(block.Content)
+			if multimodalToolResults {
+				for _, part := range media {
+					response.Parts = append(response.Parts, GeminiFunctionResponsePart{InlineData: part.InlineData})
+				}
+			} else {
+				toolMediaParts = append(toolMediaParts, media...)
+			}
+			toolResults = append(toolResults, GeminiPart{FunctionResponse: response})
 		}
 	}
 
-	return parts, strippedThinking, nil
+	parts = append(parts, toolMediaParts...)
+
+	// Interleaved notices must not split a parallel tool-result batch.
+	return append(toolResults, parts...), strippedThinking, nil
 }
 
 // parseToolResultContent 解析 tool_result 的 content
@@ -688,6 +699,45 @@ func isAntigravityOpusHighTierModel(model string) bool {
 		strings.HasPrefix(lower, "claude-opus-4-8")
 }
 
+// carbonThinkingConfig preserves the upstream default when no effort is specified.
+// https://aistudio.google.com/docs/whats-new-gemini-4-carbon
+func carbonThinkingConfig(req *ClaudeRequest, bareModel bool) *GeminiThinkingConfig {
+	cfg := &GeminiThinkingConfig{}
+	if req.Thinking != nil {
+		cfg.IncludeThoughts = req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive"
+	}
+	if bareModel {
+		if req.OutputConfig != nil {
+			switch strings.ToLower(strings.TrimSpace(req.OutputConfig.Effort)) {
+			case "none", "minimal", "low":
+				cfg.ThinkingLevel = "low"
+			case "medium":
+				cfg.ThinkingLevel = "medium"
+			case "high", "xhigh", "max":
+				cfg.ThinkingLevel = "high"
+			}
+		}
+		if req.Thinking != nil {
+			if req.Thinking.Type == "disabled" {
+				cfg.ThinkingLevel = "low"
+			} else if cfg.ThinkingLevel == "" && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens > 0 {
+				switch {
+				case req.Thinking.BudgetTokens <= 1024:
+					cfg.ThinkingLevel = "low"
+				case req.Thinking.BudgetTokens <= 8192:
+					cfg.ThinkingLevel = "medium"
+				default:
+					cfg.ThinkingLevel = "high"
+				}
+			}
+		}
+	}
+	if !cfg.IncludeThoughts && cfg.ThinkingLevel == "" {
+		return nil
+	}
+	return cfg
+}
+
 func buildGenerationConfig(req *ClaudeRequest) *GeminiGenerationConfig {
 	maxLimit := maxOutputTokensLimit(req.Model)
 	config := &GeminiGenerationConfig{
@@ -704,8 +754,16 @@ func buildGenerationConfig(req *ClaudeRequest) *GeminiGenerationConfig {
 		config.MaxOutputTokens = req.MaxTokens
 	}
 
+	// Carbon accepts thinking levels rather than token budgets. Tiered IDs, when
+	// supplied by the account catalog, already select the level upstream.
+	carbonModel := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(req.Model)), "models/")
+	isCarbon := carbonModel == "gemini-4-carbon" || carbonModel == "gemini-4-carbon-low" || carbonModel == "gemini-4-carbon-medium" || carbonModel == "gemini-4-carbon-high"
+	if isCarbon {
+		config.ThinkingConfig = carbonThinkingConfig(req, carbonModel == "gemini-4-carbon")
+	}
+
 	// Thinking 配置
-	if req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive") {
+	if !isCarbon && req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive") {
 		config.ThinkingConfig = &GeminiThinkingConfig{
 			IncludeThoughts: true,
 		}

@@ -19,8 +19,22 @@ func AnthropicToResponses(req *AnthropicRequest) (*ResponsesRequest, error) {
 // AnthropicToResponsesWithMinOutputTokens converts an Anthropic request using
 // the supplied max_output_tokens floor.
 func AnthropicToResponsesWithMinOutputTokens(req *AnthropicRequest, minOutputTokens int) (*ResponsesRequest, error) {
-	if err := openai.ValidateGPT61SolReasoningEffort(req.Model, anthropicReasoningEffort(req)); err != nil {
-		return nil, err
+	return AnthropicToResponsesWithOptions(req, AnthropicToResponsesOptions{MinOutputTokens: minOutputTokens})
+}
+
+// AnthropicToResponsesOptions controls conversion and optional deferred effort
+// validation. Callers deferring validation must validate raw selections before
+// conversion and the final effort after applying their policy.
+type AnthropicToResponsesOptions struct {
+	MinOutputTokens                int
+	DeferReasoningEffortValidation bool
+}
+
+func AnthropicToResponsesWithOptions(req *AnthropicRequest, options AnthropicToResponsesOptions) (*ResponsesRequest, error) {
+	if !options.DeferReasoningEffortValidation {
+		if err := openai.ValidateGPT61ReasoningEffort(req.Model, anthropicReasoningEffort(req)); err != nil {
+			return nil, err
+		}
 	}
 	input, err := convertAnthropicToResponsesInput(req.System, req.Messages)
 	if err != nil {
@@ -56,8 +70,8 @@ func AnthropicToResponsesWithMinOutputTokens(req *AnthropicRequest, minOutputTok
 
 	if req.MaxTokens > 0 {
 		v := req.MaxTokens
-		if v < minOutputTokens {
-			v = minOutputTokens
+		if v < options.MinOutputTokens {
+			v = options.MinOutputTokens
 		}
 		out.MaxOutputTokens = &v
 	}
@@ -68,7 +82,7 @@ func AnthropicToResponsesWithMinOutputTokens(req *AnthropicRequest, minOutputTok
 
 	// An explicit thinking disable takes precedence over output_config.effort.
 	effort := anthropicReasoningEffort(req)
-	if (openai.IsGPT61SolModelSpelling(req.Model) || openai.IsGPT61TerraModelSpelling(req.Model)) && req.OutputConfig != nil && req.OutputConfig.Effort == "max" && effort != "none" {
+	if (openai.GPT62ModelID(req.Model) != "" || openai.IsGPT61SolModelSpelling(req.Model) || openai.IsGPT61TerraModelSpelling(req.Model)) && req.OutputConfig != nil && req.OutputConfig.Effort == "max" && effort != "none" {
 		effort = "max"
 	}
 	out.Reasoning = &ResponsesReasoning{
@@ -192,6 +206,16 @@ func anthropicMsgToResponsesItems(m AnthropicMessage) ([]ResponsesInputItem, err
 		return anthropicUserToResponses(m.Content)
 	case "assistant":
 		return anthropicAssistantToResponses(m.Content)
+	case "system":
+		// Mid-conversation system turns (e.g. hook output) keep system-level
+		// authority: Responses uses developer for them, not user.
+		items, err := anthropicUserToResponses(m.Content)
+		for i := range items {
+			if items[i].Role == "user" {
+				items[i].Role = "developer"
+			}
+		}
+		return items, err
 	default:
 		return anthropicUserToResponses(m.Content)
 	}
@@ -302,6 +326,11 @@ func anthropicAssistantToResponses(raw json.RawMessage) ([]ResponsesInputItem, e
 		if sig == "" || strings.HasPrefix(sig, "gAAAA") {
 			continue
 		}
+		// CC Switch carries a JSON reasoning item in this versioned envelope,
+		// not provider ciphertext. Ignore the foreign state when resuming directly.
+		if strings.HasPrefix(sig, "ccswitch-openai-reasoning-v1:") {
+			continue
+		}
 		items = append(items, ResponsesInputItem{
 			Type:             "reasoning",
 			EncryptedContent: sig,
@@ -359,10 +388,16 @@ func fromResponsesCallID(id string) string {
 	return id
 }
 
-// anthropicImageToDataURI converts an AnthropicImageSource to a data URI string.
-// Returns "" if the source is nil or has no data.
+// anthropicImageToDataURI returns a URL source unchanged or encodes base64 data
+// as a data URI. Returns "" if the source is nil or has no image data.
 func anthropicImageToDataURI(src *AnthropicImageSource) string {
-	if src == nil || src.Data == "" {
+	if src == nil {
+		return ""
+	}
+	if src.Type == "url" {
+		return src.URL
+	}
+	if src.Data == "" {
 		return ""
 	}
 	mediaType := src.MediaType
