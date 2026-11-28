@@ -67,7 +67,7 @@ cp config.env.example config.env      # edit: region, DOMAIN, TLS_MODE, AKS_API_
 
 az login
 bash azure/create-aks.sh              # ~10 min, prints the public IP
-#   -> create the DNS A record  DOMAIN -> public IP
+#   -> create the DNS A record  DOMAIN -> public IP   (see "Domain setup" below)
 
 bash scripts/deploy.sh                # asks for user names / passwords on the first run
 ```
@@ -108,6 +108,79 @@ application only ever sees plain HTTP from nginx.
 Switching from `selfsigned` to another mode: `kubectl -n sub2api delete secret sub2api-tls`,
 change `TLS_MODE`, re-run `deploy.sh` (and `create-aks.sh` first for `letsencrypt`).
 nginx picks up a changed certificate within 5 minutes without a restart.
+
+### Domain setup: registrar DNS (GoDaddy) + Azure DNS + Let's Encrypt
+
+`TLS_MODE=letsencrypt` proves domain ownership with a DNS-01 challenge:
+cert-manager writes a temporary `_acme-challenge` TXT record, so it needs API
+access to the zone, and only Azure DNS is wired up. The domain does not have to
+leave its registrar. Delegating just the API subdomain to Azure DNS is enough,
+and the website, mail and all other records stay where they are.
+
+The example uses `api.example.com`, registered at GoDaddy, with the zone in a
+resource group `dns-rg`.
+
+1. **Create the zone in Azure DNS**, in its own resource group so that deleting
+   the cluster's resource group never deletes it:
+
+   ```bash
+   az group create --name dns-rg --location <region>
+   az network dns zone create --resource-group dns-rg --name api.example.com
+   az network dns zone show   --resource-group dns-rg --name api.example.com --query nameServers -o tsv
+   ```
+
+   The last command prints four `nsX-YY.azure-dns.*` name servers.
+
+2. **Delegate the subdomain at the registrar.** In GoDaddy (Domain → DNS → Add
+   New Record) add four `NS` records with name `api`, one per Azure name
+   server. Delete any existing `A` / `CNAME` record named `api`.
+
+   Check it (minutes to an hour): `nslookup -type=NS api.example.com` must list
+   the `azure-dns` name servers.
+
+3. **Set `config.env`** *before* running `create-aks.sh`:
+
+   ```bash
+   DOMAIN=api.example.com
+   TLS_MODE=letsencrypt
+   ACME_EMAIL=you@example.com            # Let's Encrypt expiry notices
+   DNS_ZONE_NAME=api.example.com         # the zone exactly as created in step 1
+   DNS_ZONE_RESOURCE_GROUP=dns-rg
+   ```
+
+4. **Install helm** (used only to install cert-manager): `winget install Helm.Helm`
+   on Windows, then reopen the terminal.
+
+5. **Run `bash azure/create-aks.sh`.** Besides the cluster it creates a managed
+   identity for cert-manager with the role *DNS Zone Contributor* on this one
+   zone, and prints the static public IP.
+
+6. **Create the A record in Azure DNS** (not at the registrar). The zone is the
+   host name itself, so the record name is `@`:
+
+   ```bash
+   az network dns record-set a add-record --resource-group dns-rg --zone-name api.example.com \
+     --record-set-name "@" --ipv4-address <PUBLIC_IP>
+   ```
+
+7. **Run `bash scripts/deploy.sh`.** It installs cert-manager, creates the
+   `letsencrypt-azuredns` ClusterIssuer and requests the certificate into the
+   Secret `sub2api-tls`. Renewal is automatic.
+
+   ```bash
+   kubectl -n sub2api get certificate          # READY should become True
+   nslookup api.example.com                    # should return <PUBLIC_IP>
+   ```
+
+Moving the whole domain instead: export the zone file at the registrar, create
+the zone for `example.com`, `az network dns zone import` it, compare every
+record (MX especially), disable DNSSEC at the registrar, then switch the
+registrar's name servers to the Azure ones. Use `DNS_ZONE_NAME=example.com` and
+`--record-set-name api` in step 6.
+
+On Windows run the scripts from **Git Bash**. In PowerShell, `bash` usually
+starts WSL, which cannot see the Windows `az`, `kubectl`, `kubelogin` and `helm`;
+use `& "C:\Program Files\Git\bin\bash.exe" scripts/deploy.sh` instead.
 
 ## Scaling
 
