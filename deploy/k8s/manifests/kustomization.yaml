@@ -1,0 +1,36 @@
+# Base manifests for Sub2API on AKS. Do not apply this directory directly:
+# scripts/deploy.sh generates a small overlay (.generated/) that adds the
+# "sub2api-site" ConfigMap (domain, timezone) and pins the application image,
+# and creates the Secrets these workloads reference.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sub2api
+
+resources:
+  - namespace.yaml
+  - storageclasses.yaml
+  - network-policies.yaml
+  - postgres/postgres.yaml
+  - redis/redis.yaml
+  - sub2api/sub2api.yaml
+  - nginx/nginx.yaml
+  - backup/backup.yaml
+
+# ConfigMaps get a content-hash suffix, so changing a file below rolls the
+# pods that use it.
+configMapGenerator:
+  - name: sub2api-env
+    envs:
+      - sub2api/app.env
+  - name: redis-config
+    files:
+      - redis/redis.conf
+  - name: nginx-config
+    files:
+      - nginx/sub2api.conf.template
+      - nginx/90-cert-reload.sh
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: sub2api

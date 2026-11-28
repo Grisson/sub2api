@@ -1,0 +1,113 @@
+# SIZE_PROFILE=small: shrinks the whole stack so it fits a cluster with only
+# 4 vCPUs in total (2 x 2-vCPU / 8 GiB nodes, e.g. Standard_D2s_v5).
+# Steady state reserves ~0.85 vCPU, at most ~1.1 vCPU when fully scaled out;
+# the rest is left for the AKS system pods.
+# Enabled by scripts/deploy.sh when config.env has SIZE_PROFILE=small.
+# Switch back with SIZE_PROFILE=standard (and bigger nodes) + deploy.sh.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target: { kind: Deployment, name: sub2api }
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: sub2api
+      spec:
+        template:
+          spec:
+            containers:
+              - name: sub2api
+                resources:
+                  requests: { cpu: 200m, memory: 512Mi }
+                  limits: { memory: 2Gi }
+  - target: { kind: HorizontalPodAutoscaler, name: sub2api }
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: sub2api
+      spec:
+        minReplicas: 2
+        maxReplicas: 3
+  - target: { kind: Deployment, name: nginx }
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx
+      spec:
+        template:
+          spec:
+            containers:
+              - name: nginx
+                resources:
+                  requests: { cpu: 50m, memory: 128Mi }
+                  limits: { memory: 512Mi }
+  - target: { kind: HorizontalPodAutoscaler, name: nginx }
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: nginx
+      spec:
+        minReplicas: 2
+        maxReplicas: 3
+  # Smaller memory settings for an 8 GiB node. 3 app replicas x 50 connections
+  # stays below max_connections.
+  - target: { kind: StatefulSet, name: postgres }
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgres
+                args:
+                  - -c
+                  - max_connections=200
+                  - -c
+                  - shared_buffers=512MB
+                  - -c
+                  - effective_cache_size=1GB
+                  - -c
+                  - maintenance_work_mem=128MB
+                  - -c
+                  - password_encryption=scram-sha-256
+                resources:
+                  requests: { cpu: 250m, memory: 1Gi }
+                  limits: { memory: 2Gi }
+  - target: { kind: StatefulSet, name: redis }
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis
+      spec:
+        template:
+          spec:
+            containers:
+              - name: redis
+                resources:
+                  requests: { cpu: 100m, memory: 256Mi }
+                  limits: { memory: 1Gi }
+  - target: { kind: CronJob, name: postgres-backup }
+    patch: |-
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: postgres-backup
+      spec:
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: pg-dump
+                    resources:
+                      requests: { cpu: 50m, memory: 128Mi }
+                      limits: { memory: 1Gi }

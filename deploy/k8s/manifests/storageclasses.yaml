@@ -1,0 +1,41 @@
+# Storage classes with reclaimPolicy: Retain. Deleting a PVC (or the whole
+# namespace) never deletes the underlying Azure disk / file share, so the data
+# can always be re-attached. See README "Recovery".
+#
+# StorageClass parameters are immutable. To change the SKU, create a new class.
+---
+# Azure Managed Disk (Premium SSD) for PostgreSQL and Redis data.
+# Premium_LRS disks are zonal: the pod is pinned to the zone the disk was
+# created in. If your region supports it, Premium_ZRS survives a zone outage.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sub2api-disk-retain
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+# Azure Files share (Azure Storage account) for database dumps. It lives outside
+# the database disk, so a lost or corrupted disk does not take the backups with it.
+# uid/gid 70 is the postgres user of the postgres:*-alpine image.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sub2api-files-retain
+provisioner: file.csi.azure.com
+parameters:
+  skuName: Standard_LRS
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  - dir_mode=0770
+  - file_mode=0660
+  - uid=70
+  - gid=70
+  - mfsymlinks
+  - cache=strict
+  - nosharesock

@@ -1,0 +1,13 @@
+# Namespace with the "restricted" Pod Security Standard enforced: every pod must
+# run as non-root, drop all capabilities, forbid privilege escalation and use
+# the RuntimeDefault seccomp profile, otherwise the API server rejects it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sub2api
+  labels:
+    app.kubernetes.io/part-of: sub2api
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

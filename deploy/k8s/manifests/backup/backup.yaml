@@ -1,0 +1,113 @@
+# Daily logical backup of PostgreSQL (pg_dump, custom format) to an Azure Files
+# share, i.e. an Azure Storage account that is independent of the database disk.
+# Run one on demand with scripts/backup-now.sh; restore with scripts/restore.sh.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backups
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: sub2api-files-retain
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  labels:
+    app.kubernetes.io/name: postgres-backup
+spec:
+  schedule: "17 19 * * *" # daily 19:17 UTC (03:17 Asia/Shanghai)
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+        spec:
+          serviceAccountName: postgres-backup
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-dump
+              image: postgres:18-alpine # must match the server major version
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  ts=$(date -u +%Y%m%dT%H%M%SZ)
+                  file="/backups/sub2api-${ts}.dump"
+                  echo "Dumping database ${PGDATABASE} to ${file}"
+                  pg_dump --format=custom --compress=6 --no-owner --no-acl --file="${file}.partial"
+                  pg_restore --list "${file}.partial" > /dev/null   # sanity check
+                  mv "${file}.partial" "${file}"
+                  echo "Pruning dumps older than ${RETENTION_DAYS} days"
+                  find /backups -maxdepth 1 -name 'sub2api-*.dump' -mtime +"${RETENTION_DAYS}" -delete
+                  find /backups -maxdepth 1 -name '*.partial' -mmin +720 -delete
+                  ls -lh /backups
+              env:
+                - name: RETENTION_DAYS
+                  value: "14"
+                - name: PGHOST
+                  value: postgres
+                - name: PGPORT
+                  value: "5432"
+                - name: PGDATABASE
+                  value: sub2api
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef: { name: postgres-credentials, key: username }
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: postgres-credentials, key: password }
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: postgres-backups
+            - name: tmp
+              emptyDir: {}

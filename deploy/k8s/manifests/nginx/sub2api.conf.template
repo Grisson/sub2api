@@ -1,0 +1,137 @@
+# NGINX edge for Sub2API: terminates HTTPS and proxies plain HTTP to the app.
+# Rendered by the nginx image entrypoint (envsubst) into /etc/nginx/conf.d/.
+# The only substituted variable is SERVER_NAME (the public domain); everything
+# else starting with "$" is a normal nginx variable.
+# Based on deploy/EDGE_SECURITY.md ("Nginx baseline").
+
+server_tokens off;
+
+# Per-client limits. Counters are per nginx replica, not cluster-wide.
+limit_conn_zone $binary_remote_addr zone=sub2api_conn:20m;
+limit_req_zone  $binary_remote_addr zone=sub2api_auth:20m rate=5r/s;
+limit_req_zone  $binary_remote_addr zone=sub2api_api:40m  rate=30r/s;
+limit_req_status  429;
+limit_conn_status 429;
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+# Access log without the query string: some API styles carry the key in "?key=".
+log_format sub2api escape=json
+    '{"time":"$time_iso8601","client":"$remote_addr","method":"$request_method",'
+    '"host":"$host","uri":"$uri","status":$status,"bytes":$body_bytes_sent,'
+    '"request_time":$request_time,"upstream_time":"$upstream_response_time",'
+    '"user_agent":"$http_user_agent"}';
+
+upstream sub2api_backend {
+    server sub2api:8080;
+    keepalive 64;
+}
+
+# ---------------------------------------------------------------------------
+# Health endpoint for kubelet probes (not exposed through the load balancer)
+# ---------------------------------------------------------------------------
+server {
+    listen 8081;
+    access_log off;
+    location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+    location / {
+        return 404;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Unknown Host / bare-IP scanners: drop without answering
+# ---------------------------------------------------------------------------
+server {
+    listen 8080 default_server;
+    listen 8443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    access_log off;
+    return 444;
+}
+
+# ---------------------------------------------------------------------------
+# HTTP -> HTTPS
+# ---------------------------------------------------------------------------
+server {
+    listen 8080;
+    server_name ${SERVER_NAME};
+    access_log off;
+    return 301 https://$host$request_uri;
+}
+
+# ---------------------------------------------------------------------------
+# HTTPS offload
+# ---------------------------------------------------------------------------
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name ${SERVER_NAME};
+
+    access_log /dev/stdout sub2api;
+
+    ssl_certificate     /etc/nginx/tls/tls.crt;
+    ssl_certificate_key /etc/nginx/tls/tls.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_header_timeout 10s;
+    client_body_timeout   120s;
+    client_max_body_size  256m;
+    large_client_header_buffers 4 16k;
+    limit_conn sub2api_conn 40;
+
+    # Compress the web UI and JSON, never text/event-stream (it would buffer SSE).
+    gzip on;
+    gzip_min_length 256;
+    gzip_types text/plain text/css application/json application/javascript application/xml image/svg+xml;
+
+    # Forwarded headers are always overwritten from the real TCP peer, so a
+    # client cannot spoof its address.
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header Upgrade           $http_upgrade;
+    proxy_set_header Connection        $connection_upgrade;
+
+    # Streaming (SSE / WebSocket): no buffering, long idle timeouts.
+    proxy_buffering         off;
+    proxy_request_buffering off;
+    proxy_connect_timeout   10s;
+    proxy_read_timeout      1800s;
+    proxy_send_timeout      1800s;
+
+    # Login / registration / password reset: strict rate limit against brute force.
+    location ^~ /api/v1/auth/ {
+        limit_req zone=sub2api_auth burst=10 nodelay;
+        proxy_pass http://sub2api_backend;
+    }
+
+    # Pure-text endpoints get a smaller body limit.
+    location ~ ^/(v1/)?(embeddings|alpha/search)$ {
+        client_max_body_size 32m;
+        limit_req zone=sub2api_api burst=60 nodelay;
+        proxy_pass http://sub2api_backend;
+    }
+
+    location / {
+        limit_req zone=sub2api_api burst=60 nodelay;
+        proxy_pass http://sub2api_backend;
+    }
+}
